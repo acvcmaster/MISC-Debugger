@@ -2,17 +2,13 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import {
-	Logger, logger,
-	LoggingDebugSession,
-	InitializedEvent, TerminatedEvent, StoppedEvent, BreakpointEvent, OutputEvent,
-	ProgressStartEvent, ProgressUpdateEvent, ProgressEndEvent, InvalidatedEvent,
-	Thread, StackFrame, Scope, Source, Handles, Breakpoint
-} from 'vscode-debugadapter';
+
 import { DebugProtocol } from 'vscode-debugprotocol';
-import { basename } from 'path';
-import { MockRuntime, IRuntimeBreakpoint, FileAccessor, IRuntimeVariable, timeout, IRuntimeVariableType } from './mockRuntime';
+// import { basename } from 'path';
+import { FileAccessor, RuntimeAdapter, RuntimeBreakpoint } from './mockRuntime';
 import { Subject } from 'await-notify';
+import { LoggingDebugSession, StoppedEvent, InitializedEvent, logger, Logger, Breakpoint, BreakpointEvent, Scope, Thread, OutputEvent, Source, TerminatedEvent, StackFrame } from 'vscode-debugadapter';
+import { basename } from 'path';
 
 /**
  * This interface describes the mock-debug specific launch attributes
@@ -39,23 +35,8 @@ export class MockDebugSession extends LoggingDebugSession {
 	private static threadID = 1;
 
 	// a Mock runtime (or debugger)
-	private _runtime: MockRuntime;
-
-	private _variableHandles = new Handles<'locals' | 'globals' | IRuntimeVariable>();
-
-	private _configurationDone = new Subject();
-
-	private _cancellationTokens = new Map<number, boolean>();
-
-	private _reportProgress = false;
-	private _progressId = 10000;
-	private _cancelledProgressId: string | undefined = undefined;
-	private _isProgressCancellable = true;
-
-	private _valuesInHex = false;
-	private _useInvalidatedEvent = false;
-
-	private _addressesInHex = true;
+	private runtimeAdapter: RuntimeAdapter;
+	private configurationDone = new Subject();
 
 	/**
 	 * Creates a new debug adapter that is used for one debug session.
@@ -68,48 +49,43 @@ export class MockDebugSession extends LoggingDebugSession {
 		this.setDebuggerLinesStartAt1(false);
 		this.setDebuggerColumnsStartAt1(false);
 
-		this._runtime = new MockRuntime(fileAccessor);
+		this.runtimeAdapter = new RuntimeAdapter(fileAccessor);
 
 		// setup event handlers
-		this._runtime.on('stopOnEntry', () => {
+		this.setupEvents();
+	}
+
+	/** Setup event handlers */
+	protected setupEvents() {
+		this.runtimeAdapter.on('stopOnEntry', () => {
 			this.sendEvent(new StoppedEvent('entry', MockDebugSession.threadID));
 		});
-		this._runtime.on('stopOnStep', () => {
+		this.runtimeAdapter.on('stopOnStep', () => {
 			this.sendEvent(new StoppedEvent('step', MockDebugSession.threadID));
 		});
-		this._runtime.on('stopOnBreakpoint', () => {
+		this.runtimeAdapter.on('stopOnBreakpoint', () => {
 			this.sendEvent(new StoppedEvent('breakpoint', MockDebugSession.threadID));
 		});
-		this._runtime.on('stopOnDataBreakpoint', () => {
-			this.sendEvent(new StoppedEvent('data breakpoint', MockDebugSession.threadID));
-		});
-		this._runtime.on('stopOnInstructionBreakpoint', () => {
-			this.sendEvent(new StoppedEvent('instruction breakpoint', MockDebugSession.threadID));
-		});
-		this._runtime.on('stopOnException', (exception) => {
+		this.runtimeAdapter.on('stopOnException', (exception) => {
 			if (exception) {
 				this.sendEvent(new StoppedEvent(`exception(${exception})`, MockDebugSession.threadID));
 			} else {
 				this.sendEvent(new StoppedEvent('exception', MockDebugSession.threadID));
 			}
 		});
-		this._runtime.on('breakpointValidated', (bp: IRuntimeBreakpoint) => {
-			this.sendEvent(new BreakpointEvent('changed', { verified: bp.verified, id: bp.id } as DebugProtocol.Breakpoint));
+		this.runtimeAdapter.on('breakpointValidated', (breakpoint: RuntimeBreakpoint) => {
+			this.sendEvent(new BreakpointEvent('changed', { verified: breakpoint.verified, id: breakpoint.id } as DebugProtocol.Breakpoint));
 		});
-		this._runtime.on('output', (text, filePath, line, column) => {
+		this.runtimeAdapter.on('output', (text, filePath, line, column) => {
 			const e: DebugProtocol.OutputEvent = new OutputEvent(`${text}\n`);
-
-			if (text === 'start' || text === 'startCollapsed' || text === 'end') {
-				e.body.group = text;
-				e.body.output = `group-${text}\n`;
-			}
 
 			e.body.source = this.createSource(filePath);
 			e.body.line = this.convertDebuggerLineToClient(line);
 			e.body.column = this.convertDebuggerColumnToClient(column);
+
 			this.sendEvent(e);
 		});
-		this._runtime.on('end', () => {
+		this.runtimeAdapter.on('end', () => {
 			this.sendEvent(new TerminatedEvent());
 		});
 	}
@@ -119,82 +95,25 @@ export class MockDebugSession extends LoggingDebugSession {
 	 * to interrogate the features the debug adapter provides.
 	 */
 	protected initializeRequest(response: DebugProtocol.InitializeResponse, args: DebugProtocol.InitializeRequestArguments): void {
-
-		if (args.supportsProgressReporting) {
-			this._reportProgress = true;
-		}
-		if (args.supportsInvalidatedEvent) {
-			this._useInvalidatedEvent = true;
-		}
-
 		// build and return the capabilities of this debug adapter:
-		response.body = response.body || {};
-
-		// the adapter implements the configurationDone request.
-		response.body.supportsConfigurationDoneRequest = true;
-
-		// make VS Code use 'evaluate' when hovering over source
-		response.body.supportsEvaluateForHovers = true;
-
-		// make VS Code show a 'step back' button
-		response.body.supportsStepBack = true;
-
-		// make VS Code support data breakpoints
-		response.body.supportsDataBreakpoints = true;
-
-		// make VS Code support completion in REPL
-		response.body.supportsCompletionsRequest = true;
-		response.body.completionTriggerCharacters = [ ".", "[" ];
-
-		// make VS Code send cancel request
-		response.body.supportsCancelRequest = true;
-
-		// make VS Code send the breakpointLocations request
-		response.body.supportsBreakpointLocationsRequest = true;
-
-		// make VS Code provide "Step in Target" functionality
-		response.body.supportsStepInTargetsRequest = true;
-
-		// the adapter defines two exceptions filters, one with support for conditions.
-		response.body.supportsExceptionFilterOptions = true;
-		response.body.exceptionBreakpointFilters = [
-			{
-				filter: 'namedException',
-				label: "Named Exception",
-				description: `Break on named exceptions. Enter the exception's name as the Condition.`,
-				default: false,
-				supportsCondition: true,
-				conditionDescription: `Enter the exception's name`
-			},
-			{
-				filter: 'otherExceptions',
-				label: "Other Exceptions",
-				description: 'This is a other exception',
-				default: true,
-				supportsCondition: false
-			}
-		];
-
-		// make VS Code send exceptionInfo request
-		response.body.supportsExceptionInfoRequest = true;
-
-		// make VS Code send setVariable request
-		response.body.supportsSetVariable = false;
-
-		// make VS Code send setExpression request
-		response.body.supportsSetExpression = true;
-
-		// make VS Code send disassemble request
-		response.body.supportsDisassembleRequest = true;
-		response.body.supportsSteppingGranularity = true;
-		response.body.supportsInstructionBreakpoints = true;
-
-		this.sendResponse(response);
+		this.setCapabilities(response);
 
 		// since this debug adapter can accept configuration requests like 'setBreakpoint' at any time,
 		// we request them early by sending an 'initializeRequest' to the frontend.
 		// The frontend will end the configuration sequence by calling 'configurationDone' request.
 		this.sendEvent(new InitializedEvent());
+	}
+
+	private setCapabilities(response: DebugProtocol.InitializeResponse) {
+		response.body = response.body || {};
+		// the adapter implements the configurationDone request.
+		response.body.supportsConfigurationDoneRequest = true;
+		// make VS Code send cancel request
+		response.body.supportsCancelRequest = true;
+		// make VS Code send the breakpointLocations request
+		response.body.supportsBreakpointLocationsRequest = true;
+
+		this.sendResponse(response);
 	}
 
 	/**
@@ -205,7 +124,7 @@ export class MockDebugSession extends LoggingDebugSession {
 		super.configurationDoneRequest(response, args);
 
 		// notify the launchRequest that configuration has finished
-		this._configurationDone.notify();
+		this.configurationDone.notify();
 	}
 
 	protected async launchRequest(response: DebugProtocol.LaunchResponse, args: ILaunchRequestArguments) {
@@ -213,22 +132,20 @@ export class MockDebugSession extends LoggingDebugSession {
 		// make sure to 'Stop' the buffered logging if 'trace' is not set
 		logger.setup(args.trace ? Logger.LogLevel.Verbose : Logger.LogLevel.Stop, false);
 
-		this._runtime.debug = !args.noDebug;
-
 		// wait until configuration has finished (and configurationDoneRequest has been called)
-		await this._configurationDone.wait(1000);
+		await this.configurationDone.wait(1000);
 
 		// start the program in the runtime
-		await this._runtime.start(args.program, !!args.stopOnEntry);
+		const startResponse = await this.runtimeAdapter.start(args.program, !!args.stopOnEntry);
 
-		if (args.compileError) {
+		if (startResponse.hasError) {
 			// simulate a compile/build error in "launch" request:
 			// the error should not result in a modal dialog since 'showUser' is set to false.
 			// A missing 'showUser' should result in a modal dialog.
 			this.sendErrorResponse(response, {
 				id: 1001,
-				format: `compile error: some fake error.`,
-				showUser: args.compileError === 'show' ? true : (args.compileError === 'hide' ? false : undefined)
+				format: `Runtime error: ${startResponse.error}`,
+				showUser: true
 			});
 		} else {
 			this.sendResponse(response);
@@ -236,129 +153,95 @@ export class MockDebugSession extends LoggingDebugSession {
 	}
 
 	protected async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
-
-		const path = args.source.path as string;
 		const clientLines = args.lines || [];
 
 		// clear all breakpoints for this file
-		this._runtime.clearBreakpoints(path);
+		await this.runtimeAdapter.clearBreakpoints();
 
 		// set and verify breakpoint locations
-		const actualBreakpoints0 = clientLines.map(async l => {
-			const { verified, line, id } = await this._runtime.setBreakPoint(path, this.convertClientLineToDebugger(l));
-			const bp = new Breakpoint(verified, this.convertDebuggerLineToClient(line)) as DebugProtocol.Breakpoint;
-			bp.id= id;
-			return bp;
+		const trueBreakpoints = clientLines.map(async l => {
+			const { verified, line, id } = await this.runtimeAdapter.setBreakPoint(this.convertClientLineToDebugger(l));
+			const breakpoint = new Breakpoint(verified, this.convertDebuggerLineToClient(line)) as DebugProtocol.Breakpoint;
+			return { ...breakpoint, id };
 		});
-		const actualBreakpoints = await Promise.all<DebugProtocol.Breakpoint>(actualBreakpoints0);
+
+		const breakpoints = await Promise.all<DebugProtocol.Breakpoint>(trueBreakpoints);
 
 		// send back the actual breakpoint positions
-		response.body = {
-			breakpoints: actualBreakpoints
-		};
-		this.sendResponse(response);
+		this.sendResponse({ ...response, body: { ...response.body, breakpoints } });
 	}
 
 	protected breakpointLocationsRequest(response: DebugProtocol.BreakpointLocationsResponse, args: DebugProtocol.BreakpointLocationsArguments, request?: DebugProtocol.Request): void {
-
-		if (args.source.path) {
-			const bps = this._runtime.getBreakpoints(args.source.path, this.convertClientLineToDebugger(args.line));
-			response.body = {
-				breakpoints: bps.map(col => {
-					return {
-						line: args.line,
-						column: this.convertDebuggerColumnToClient(col)
-					};
-				})
-			};
-		} else {
-			response.body = {
-				breakpoints: []
-			};
-		}
-		this.sendResponse(response);
-	}
-
-	protected async setExceptionBreakPointsRequest(response: DebugProtocol.SetExceptionBreakpointsResponse, args: DebugProtocol.SetExceptionBreakpointsArguments): Promise<void> {
-
-		let namedException: string | undefined = undefined;
-		let otherExceptions = false;
-
-		if (args.filterOptions) {
-			for (const filterOption of args.filterOptions) {
-				switch (filterOption.filterId) {
-					case 'namedException':
-						namedException = args.filterOptions[0].condition;
-						break;
-					case 'otherExceptions':
-						otherExceptions = true;
-						break;
-				}
-			}
-		}
-
-		if (args.filters) {
-			if (args.filters.indexOf('otherExceptions') >= 0) {
-				otherExceptions = true;
-			}
-		}
-
-		this._runtime.setExceptionsFilters(namedException, otherExceptions);
-
-		this.sendResponse(response);
-	}
-
-	protected exceptionInfoRequest(response: DebugProtocol.ExceptionInfoResponse, args: DebugProtocol.ExceptionInfoArguments) {
 		response.body = {
-			exceptionId: 'Exception ID',
-			description: 'This is a descriptive description of the exception.',
-			breakMode: 'always',
-			details: {
-				message: 'Message contained in the exception.',
-				typeName: 'Short type name of the exception object',
-				stackTrace: 'stack frame 1\nstack frame 2',
-			}
+			breakpoints: []
 		};
+
 		this.sendResponse(response);
 	}
+
+	// protected async setExceptionBreakPointsRequest(response: DebugProtocol.SetExceptionBreakpointsResponse, args: DebugProtocol.SetExceptionBreakpointsArguments): Promise<void> {
+
+	// 	let namedException: string | undefined = undefined;
+	// 	let otherExceptions = false;
+
+	// 	if (args.filterOptions) {
+	// 		for (const filterOption of args.filterOptions) {
+	// 			switch (filterOption.filterId) {
+	// 				case 'namedException':
+	// 					namedException = args.filterOptions[0].condition;
+	// 					break;
+	// 				case 'otherExceptions':
+	// 					otherExceptions = true;
+	// 					break;
+	// 			}
+	// 		}
+	// 	}
+
+	// 	if (args.filters) {
+	// 		if (args.filters.indexOf('otherExceptions') >= 0) {
+	// 			otherExceptions = true;
+	// 		}
+	// 	}
+
+	// 	this._runtime.setExceptionsFilters(namedException, otherExceptions);
+
+	// 	this.sendResponse(response);
+	// }
+
+	// protected exceptionInfoRequest(response: DebugProtocol.ExceptionInfoResponse, args: DebugProtocol.ExceptionInfoArguments) {
+	// 	response.body = {
+	// 		exceptionId: 'Exception ID',
+	// 		description: 'This is a descriptive description of the exception.',
+	// 		breakMode: 'always',
+	// 		details: {
+	// 			message: 'Message contained in the exception.',
+	// 			typeName: 'Short type name of the exception object',
+	// 			stackTrace: 'stack frame 1\nstack frame 2',
+	// 		}
+	// 	};
+	// 	this.sendResponse(response);
+	// }
 
 	protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
 
 		// runtime supports no threads so just return a default thread.
 		response.body = {
 			threads: [
-				new Thread(MockDebugSession.threadID, "thread 1")
+				new Thread(MockDebugSession.threadID, "Thread 1")
 			]
 		};
 		this.sendResponse(response);
 	}
 
-	protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
+	protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
 
-		const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
-		const maxLevels = typeof args.levels === 'number' ? args.levels : 1000;
-		const endFrame = startFrame + maxLevels;
-
-		const stk = this._runtime.stack(startFrame, endFrame);
+		const stackFrames = await this.runtimeAdapter.getStackFrames();
 
 		response.body = {
-			stackFrames: stk.frames.map((f, ix) => {
-				const sf: DebugProtocol.StackFrame = new StackFrame(f.index, f.name, this.createSource(f.file), this.convertDebuggerLineToClient(f.line));
-				if (typeof f.column === 'number') {
-					sf.column = this.convertDebuggerColumnToClient(f.column);
-				}
-				if (typeof f.instruction === 'number') {
-					const address = this.formatAddress(f.instruction);
-					sf.name = `${f.name} ${address}`; 
-					sf.instructionPointerReference = address;
-				}
-
-				return sf;
-			}),
-			//no totalFrames: 				// VS Code has to probe/guess. Should result in a max. of two requests
-			totalFrames: stk.count			// stk.count is the correct size, should result in a max. of two requests
-			//totalFrames: 1000000 			// not the correct size, should result in a max. of two requests
-			//totalFrames: endFrame + 20 	// dynamically increases the size with every requested chunk, results in paging
+			stackFrames: stackFrames.frames.map(frame =>
+				new StackFrame(frame.index, frame.name,
+					this.createSource(frame.file), this.convertDebuggerLineToClient(frame.line))),
+			totalFrames: stackFrames.count
 		};
 		this.sendResponse(response);
 	}
@@ -367,427 +250,412 @@ export class MockDebugSession extends LoggingDebugSession {
 
 		response.body = {
 			scopes: [
-				new Scope("Locals", this._variableHandles.create('locals'), false),
-				new Scope("Globals", this._variableHandles.create('globals'), true)
+				new Scope("Globals", 0, true)
 			]
 		};
 		this.sendResponse(response);
 	}
 
 	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): Promise<void> {
-
-		let vs: IRuntimeVariable[] = [];
-		
-		const v = this._variableHandles.get(args.variablesReference);
-		if (v === 'locals') {
-			vs = this._runtime.getLocalVariables();
-		} else if (v === 'globals') {
-			if (request) {
-				this._cancellationTokens.set(request.seq, false);
-				vs = await this._runtime.getGlobalVariables(() => !!this._cancellationTokens.get(request.seq));
-				this._cancellationTokens.delete(request.seq);
-			} else {
-				vs = await this._runtime.getGlobalVariables();
+		this.sendResponse({
+			...response, body: {
+				...response.body, variables: [
+					{ name: 'global_R1', value: 0 },
+					{ name: 'global_R2', value: 0 },
+					{ name: 'global_R3', value: 0 },
+					{ name: 'global_R4', value: 0 },
+					{ name: 'global_IP', value: 0 },
+					{ name: 'global_SP', value: 0 }
+				]
 			}
-		} else if (v && Array.isArray(v.value)) {
-			vs = v.value;
-		}
-
-		response.body = {
-			variables: vs.map(v => this.convertFromRuntime(v))
-		};
-		this.sendResponse(response);
+		});
 	}
 
 	protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): void {
-		const scope = this._variableHandles.get(args.variablesReference);
-		if (scope === 'locals') {
-			const rv = this._runtime.getLocalVariable(args.name);
-			if (rv) {
-				rv.value = this.convertToRuntime(args.value);
-				response.body = this.convertFromRuntime(rv);
-			}
-		}
+		// const scope = this._variableHandles.get(args.variablesReference);
+		// if (scope === 'locals') {
+		// 	const rv = this._runtime.getLocalVariable(args.name);
+		// 	if (rv) {
+		// 		rv.value = this.convertToRuntime(args.value);
+		// 		response.body = this.convertFromRuntime(rv);
+		// 	}
+		// }
 		this.sendResponse(response);
 	}
 
-	protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
-		this._runtime.continue(false);
+	protected async continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
+		await this.runtimeAdapter.continue();
 		this.sendResponse(response);
 	}
 
-	protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments): void {
-		this._runtime.continue(true);
-		this.sendResponse(response);
- 	}
-
-	protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
-		this._runtime.step(args.granularity === 'instruction', false);
+	protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
+		console.log(args);
+		await this.runtimeAdapter.step();
 		this.sendResponse(response);
 	}
 
-	protected stepBackRequest(response: DebugProtocol.StepBackResponse, args: DebugProtocol.StepBackArguments): void {
-		this._runtime.step(args.granularity === 'instruction', true);
-		this.sendResponse(response);
-	}
+	// protected stepBackRequest(response: DebugProtocol.StepBackResponse, args: DebugProtocol.StepBackArguments): void {
+	// 	this._runtime.step(args.granularity === 'instruction', true);
+	// 	this.sendResponse(response);
+	// }
 
-	protected stepInTargetsRequest(response: DebugProtocol.StepInTargetsResponse, args: DebugProtocol.StepInTargetsArguments) {
-		const targets = this._runtime.getStepInTargets(args.frameId);
-		response.body = {
-			targets: targets.map(t => {
-				return { id: t.id, label: t.label };
-			})
-		};
-		this.sendResponse(response);
-	}
+	// protected stepInTargetsRequest(response: DebugProtocol.StepInTargetsResponse, args: DebugProtocol.StepInTargetsArguments) {
+	// 	const targets = this._runtime.getStepInTargets(args.frameId);
+	// 	response.body = {
+	// 		targets: targets.map(t => {
+	// 			return { id: t.id, label: t.label };
+	// 		})
+	// 	};
+	// 	this.sendResponse(response);
+	// }
 
-	protected stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): void {
-		this._runtime.stepIn(args.targetId);
-		this.sendResponse(response);
-	}
+	// protected stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): void {
+	// 	this._runtime.stepIn(args.targetId);
+	// 	this.sendResponse(response);
+	// }
 
-	protected stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): void {
-		this._runtime.stepOut();
-		this.sendResponse(response);
-	}
+	// protected stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): void {
+	// 	this._runtime.stepOut();
+	// 	this.sendResponse(response);
+	// }
 
-	protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
+	// protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
 
-		let reply: string | undefined;
-		let rv: IRuntimeVariable | undefined;
+	// 	let reply: string | undefined;
+	// 	let rv: IRuntimeVariable | undefined;
 
-		switch (args.context) {
-			case 'repl':
-				// handle some REPL commands:
-				// 'evaluate' supports to create and delete breakpoints from the 'repl':
-				const matches = /new +([0-9]+)/.exec(args.expression);
-				if (matches && matches.length === 2) {
-					const mbp = await this._runtime.setBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
-					const bp = new Breakpoint(mbp.verified, this.convertDebuggerLineToClient(mbp.line), undefined, this.createSource(this._runtime.sourceFile)) as DebugProtocol.Breakpoint;
-					bp.id= mbp.id;
-					this.sendEvent(new BreakpointEvent('new', bp));
-					reply = `breakpoint created`;
-				} else {
-					const matches = /del +([0-9]+)/.exec(args.expression);
-					if (matches && matches.length === 2) {
-						const mbp = this._runtime.clearBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
-						if (mbp) {
-							const bp = new Breakpoint(false) as DebugProtocol.Breakpoint;
-							bp.id= mbp.id;
-							this.sendEvent(new BreakpointEvent('removed', bp));
-							reply = `breakpoint deleted`;
-						}
-					} else {
-						const matches = /progress/.exec(args.expression);
-						if (matches && matches.length === 1) {
-							if (this._reportProgress) {
-								reply = `progress started`;
-								this.progressSequence();
-							} else {
-								reply = `frontend doesn't support progress (capability 'supportsProgressReporting' not set)`;
-							}
-						}
-					}
-				}
-				// fall through
+	// 	switch (args.context) {
+	// 		case 'repl':
+	// 			// handle some REPL commands:
+	// 			// 'evaluate' supports to create and delete breakpoints from the 'repl':
+	// 			const matches = /new +([0-9]+)/.exec(args.expression);
+	// 			if (matches && matches.length === 2) {
+	// 				const mbp = await this._runtime.setBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
+	// 				const bp = new Breakpoint(mbp.verified, this.convertDebuggerLineToClient(mbp.line), undefined, this.createSource(this._runtime.sourceFile)) as DebugProtocol.Breakpoint;
+	// 				bp.id= mbp.id;
+	// 				this.sendEvent(new BreakpointEvent('new', bp));
+	// 				reply = `breakpoint created`;
+	// 			} else {
+	// 				const matches = /del +([0-9]+)/.exec(args.expression);
+	// 				if (matches && matches.length === 2) {
+	// 					const mbp = this._runtime.clearBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
+	// 					if (mbp) {
+	// 						const bp = new Breakpoint(false) as DebugProtocol.Breakpoint;
+	// 						bp.id= mbp.id;
+	// 						this.sendEvent(new BreakpointEvent('removed', bp));
+	// 						reply = `breakpoint deleted`;
+	// 					}
+	// 				} else {
+	// 					const matches = /progress/.exec(args.expression);
+	// 					if (matches && matches.length === 1) {
+	// 						if (this._reportProgress) {
+	// 							reply = `progress started`;
+	// 							this.progressSequence();
+	// 						} else {
+	// 							reply = `frontend doesn't support progress (capability 'supportsProgressReporting' not set)`;
+	// 						}
+	// 					}
+	// 				}
+	// 			}
+	// 			// fall through
 
-			default:
-				if (args.expression.startsWith('$')) {
-					rv = this._runtime.getLocalVariable(args.expression.substr(1));
-				} else {
-					rv = {
-						name: 'eval',
-						value: this.convertToRuntime(args.expression)
-					};
-				}
-				break;
-		}
+	// 		default:
+	// 			if (args.expression.startsWith('$')) {
+	// 				rv = this._runtime.getLocalVariable(args.expression.substr(1));
+	// 			} else {
+	// 				rv = {
+	// 					name: 'eval',
+	// 					value: this.convertToRuntime(args.expression)
+	// 				};
+	// 			}
+	// 			break;
+	// 	}
 
-		if (rv) {
-			const v = this.convertFromRuntime(rv);
-			response.body = {
-				result: v.value,
-				type: v.type,
-				variablesReference: v.variablesReference
-			};
-		} else {
-			response.body = {
-				result: reply ? reply : `evaluate(context: '${args.context}', '${args.expression}')`,
-				variablesReference: 0
-			};
-		}
+	// 	if (rv) {
+	// 		const v = this.convertFromRuntime(rv);
+	// 		response.body = {
+	// 			result: v.value,
+	// 			type: v.type,
+	// 			variablesReference: v.variablesReference
+	// 		};
+	// 	} else {
+	// 		response.body = {
+	// 			result: reply ? reply : `evaluate(context: '${args.context}', '${args.expression}')`,
+	// 			variablesReference: 0
+	// 		};
+	// 	}
 
-		this.sendResponse(response);
-	}
+	// 	this.sendResponse(response);
+	// }
 
-	protected setExpressionRequest(response: DebugProtocol.SetExpressionResponse, args: DebugProtocol.SetExpressionArguments): void {
+	// protected setExpressionRequest(response: DebugProtocol.SetExpressionResponse, args: DebugProtocol.SetExpressionArguments): void {
 
-		if (args.expression.startsWith('$')) {
-			const rv = this._runtime.getLocalVariable(args.expression.substr(1));
-			if (rv) {
-				rv.value = this.convertToRuntime(args.value);
-				response.body = this.convertFromRuntime(rv);
-				this.sendResponse(response);
-			} else {
-				this.sendErrorResponse(response, {
-					id: 1002,
-					format: `variable '{lexpr}' not found`,
-					variables: { lexpr: args.expression },
-					showUser: true
-				});	
-			}
-		} else {
-			this.sendErrorResponse(response, {
-				id: 1003,
-				format: `'{lexpr}' not an assignable expression`,
-				variables: { lexpr: args.expression },
-				showUser: true
-			});
-		}
-	}
+	// 	if (args.expression.startsWith('$')) {
+	// 		const rv = this._runtime.getLocalVariable(args.expression.substr(1));
+	// 		if (rv) {
+	// 			rv.value = this.convertToRuntime(args.value);
+	// 			response.body = this.convertFromRuntime(rv);
+	// 			this.sendResponse(response);
+	// 		} else {
+	// 			this.sendErrorResponse(response, {
+	// 				id: 1002,
+	// 				format: `variable '{lexpr}' not found`,
+	// 				variables: { lexpr: args.expression },
+	// 				showUser: true
+	// 			});	
+	// 		}
+	// 	} else {
+	// 		this.sendErrorResponse(response, {
+	// 			id: 1003,
+	// 			format: `'{lexpr}' not an assignable expression`,
+	// 			variables: { lexpr: args.expression },
+	// 			showUser: true
+	// 		});
+	// 	}
+	// }
 
-	private async progressSequence() {
+	// private async progressSequence() {
 
-		const ID = '' + this._progressId++;
+	// 	const ID = '' + this._progressId++;
 
-		await timeout(100);
+	// 	await timeout(100);
 
-		const title = this._isProgressCancellable ? 'Cancellable operation' : 'Long running operation';
-		const startEvent: DebugProtocol.ProgressStartEvent = new ProgressStartEvent(ID, title);
-		startEvent.body.cancellable = this._isProgressCancellable;
-		this._isProgressCancellable = !this._isProgressCancellable;
-		this.sendEvent(startEvent);
-		this.sendEvent(new OutputEvent(`start progress: ${ID}\n`));
+	// 	const title = this._isProgressCancellable ? 'Cancellable operation' : 'Long running operation';
+	// 	const startEvent: DebugProtocol.ProgressStartEvent = new ProgressStartEvent(ID, title);
+	// 	startEvent.body.cancellable = this._isProgressCancellable;
+	// 	this._isProgressCancellable = !this._isProgressCancellable;
+	// 	this.sendEvent(startEvent);
+	// 	this.sendEvent(new OutputEvent(`start progress: ${ID}\n`));
 
-		let endMessage = 'progress ended';
+	// 	let endMessage = 'progress ended';
 
-		for (let i = 0; i < 100; i++) {
-			await timeout(500);
-			this.sendEvent(new ProgressUpdateEvent(ID, `progress: ${i}`));
-			if (this._cancelledProgressId === ID) {
-				endMessage = 'progress cancelled';
-				this._cancelledProgressId = undefined;
-				this.sendEvent(new OutputEvent(`cancel progress: ${ID}\n`));
-				break;
-			}
-		}
-		this.sendEvent(new ProgressEndEvent(ID, endMessage));
-		this.sendEvent(new OutputEvent(`end progress: ${ID}\n`));
+	// 	for (let i = 0; i < 100; i++) {
+	// 		await timeout(500);
+	// 		this.sendEvent(new ProgressUpdateEvent(ID, `progress: ${i}`));
+	// 		if (this._cancelledProgressId === ID) {
+	// 			endMessage = 'progress cancelled';
+	// 			this._cancelledProgressId = undefined;
+	// 			this.sendEvent(new OutputEvent(`cancel progress: ${ID}\n`));
+	// 			break;
+	// 		}
+	// 	}
+	// 	this.sendEvent(new ProgressEndEvent(ID, endMessage));
+	// 	this.sendEvent(new OutputEvent(`end progress: ${ID}\n`));
 
-		this._cancelledProgressId = undefined;
-	}
+	// 	this._cancelledProgressId = undefined;
+	// }
 
-	protected dataBreakpointInfoRequest(response: DebugProtocol.DataBreakpointInfoResponse, args: DebugProtocol.DataBreakpointInfoArguments): void {
+	// protected dataBreakpointInfoRequest(response: DebugProtocol.DataBreakpointInfoResponse, args: DebugProtocol.DataBreakpointInfoArguments): void {
 
-		response.body = {
-            dataId: null,
-            description: "cannot break on data access",
-            accessTypes: undefined,
-            canPersist: false
-        };
+	// 	response.body = {
+	//         dataId: null,
+	//         description: "cannot break on data access",
+	//         accessTypes: undefined,
+	//         canPersist: false
+	//     };
 
-		if (args.variablesReference && args.name) {
-			const v = this._variableHandles.get(args.variablesReference);
-			if (v === 'globals') {
-				response.body.dataId = args.name;
-				response.body.description = args.name;
-				response.body.accessTypes = [ "write" ];
-				response.body.canPersist = true;
-			} else {
-				response.body.dataId = args.name;
-				response.body.description = args.name;
-				response.body.accessTypes = ["read", "write", "readWrite"];
-				response.body.canPersist = true;
-			}
-		}
+	// 	if (args.variablesReference && args.name) {
+	// 		const v = this._variableHandles.get(args.variablesReference);
+	// 		if (v === 'globals') {
+	// 			response.body.dataId = args.name;
+	// 			response.body.description = args.name;
+	// 			response.body.accessTypes = [ "write" ];
+	// 			response.body.canPersist = true;
+	// 		} else {
+	// 			response.body.dataId = args.name;
+	// 			response.body.description = args.name;
+	// 			response.body.accessTypes = ["read", "write", "readWrite"];
+	// 			response.body.canPersist = true;
+	// 		}
+	// 	}
 
-		this.sendResponse(response);
-	}
+	// 	this.sendResponse(response);
+	// }
 
-	protected setDataBreakpointsRequest(response: DebugProtocol.SetDataBreakpointsResponse, args: DebugProtocol.SetDataBreakpointsArguments): void {
+	// protected setDataBreakpointsRequest(response: DebugProtocol.SetDataBreakpointsResponse, args: DebugProtocol.SetDataBreakpointsArguments): void {
 
-		// clear all data breakpoints
-		this._runtime.clearAllDataBreakpoints();
+	// 	// clear all data breakpoints
+	// 	this._runtime.clearAllDataBreakpoints();
 
-		response.body = {
-			breakpoints: []
-		};
+	// 	response.body = {
+	// 		breakpoints: []
+	// 	};
 
-		for (const dbp of args.breakpoints) {
-			const ok = this._runtime.setDataBreakpoint(dbp.dataId, dbp.accessType || 'write');
-			response.body.breakpoints.push({
-				verified: ok
-			});
-		}
+	// 	for (const dbp of args.breakpoints) {
+	// 		const ok = this._runtime.setDataBreakpoint(dbp.dataId, dbp.accessType || 'write');
+	// 		response.body.breakpoints.push({
+	// 			verified: ok
+	// 		});
+	// 	}
 
-		this.sendResponse(response);
-	}
+	// 	this.sendResponse(response);
+	// }
 
-	protected completionsRequest(response: DebugProtocol.CompletionsResponse, args: DebugProtocol.CompletionsArguments): void {
+	// protected completionsRequest(response: DebugProtocol.CompletionsResponse, args: DebugProtocol.CompletionsArguments): void {
 
-		response.body = {
-			targets: [
-				{
-					label: "item 10",
-					sortText: "10"
-				},
-				{
-					label: "item 1",
-					sortText: "01"
-				},
-				{
-					label: "item 2",
-					sortText: "02"
-				},
-				{
-					label: "array[]",
-					selectionStart: 6,
-					sortText: "03"
-				},
-				{
-					label: "func(arg)",
-					selectionStart: 5,
-					selectionLength: 3,
-					sortText: "04"
-				}
-			]
-		};
-		this.sendResponse(response);
-	}
+	// 	response.body = {
+	// 		targets: [
+	// 			{
+	// 				label: "item 10",
+	// 				sortText: "10"
+	// 			},
+	// 			{
+	// 				label: "item 1",
+	// 				sortText: "01"
+	// 			},
+	// 			{
+	// 				label: "item 2",
+	// 				sortText: "02"
+	// 			},
+	// 			{
+	// 				label: "array[]",
+	// 				selectionStart: 6,
+	// 				sortText: "03"
+	// 			},
+	// 			{
+	// 				label: "func(arg)",
+	// 				selectionStart: 5,
+	// 				selectionLength: 3,
+	// 				sortText: "04"
+	// 			}
+	// 		]
+	// 	};
+	// 	this.sendResponse(response);
+	// }
 
-	protected cancelRequest(response: DebugProtocol.CancelResponse, args: DebugProtocol.CancelArguments) {
-		if (args.requestId) {
-			this._cancellationTokens.set(args.requestId, true);
-		}
-		if (args.progressId) {
-			this._cancelledProgressId= args.progressId;
-		}
-	}
+	// protected cancelRequest(response: DebugProtocol.CancelResponse, args: DebugProtocol.CancelArguments) {
+	// 	if (args.requestId) {
+	// 		this._cancellationTokens.set(args.requestId, true);
+	// 	}
+	// 	if (args.progressId) {
+	// 		this._cancelledProgressId= args.progressId;
+	// 	}
+	// }
 
-	protected disassembleRequest(response: DebugProtocol.DisassembleResponse, args: DebugProtocol.DisassembleArguments) {
+	// protected disassembleRequest(response: DebugProtocol.DisassembleResponse, args: DebugProtocol.DisassembleArguments) {
 
-		const baseAddress = parseInt(args.memoryReference);
-		const offset = args.instructionOffset || 0;
-		const count = args.instructionCount;
+	// 	const baseAddress = parseInt(args.memoryReference);
+	// 	const offset = args.instructionOffset || 0;
+	// 	const count = args.instructionCount;
 
-		const isHex = args.memoryReference.startsWith('0x');
-		const pad = isHex ? args.memoryReference.length-2 : args.memoryReference.length;
+	// 	const isHex = args.memoryReference.startsWith('0x');
+	// 	const pad = isHex ? args.memoryReference.length-2 : args.memoryReference.length;
 
-		const instructions = this._runtime.disassemble(baseAddress+offset, count).map(instruction => {
-			const address = instruction.address.toString(isHex ? 16 : 10).padStart(pad, '0');
-			return {
-				address: isHex ? `0x${address}` : `${address}`,
-				instruction: instruction.instruction
-			};
-		});
+	// 	const instructions = this._runtime.disassemble(baseAddress+offset, count).map(instruction => {
+	// 		const address = instruction.address.toString(isHex ? 16 : 10).padStart(pad, '0');
+	// 		return {
+	// 			address: isHex ? `0x${address}` : `${address}`,
+	// 			instruction: instruction.instruction
+	// 		};
+	// 	});
 
-		response.body = {
-			instructions: instructions
-		};
-		this.sendResponse(response);
-	}
+	// 	response.body = {
+	// 		instructions: instructions
+	// 	};
+	// 	this.sendResponse(response);
+	// }
 
-	protected setInstructionBreakpointsRequest(response: DebugProtocol.SetInstructionBreakpointsResponse, args: DebugProtocol.SetInstructionBreakpointsArguments) {
+	// protected setInstructionBreakpointsRequest(response: DebugProtocol.SetInstructionBreakpointsResponse, args: DebugProtocol.SetInstructionBreakpointsArguments) {
 
-		// clear all instruction breakpoints
-		this._runtime.clearInstructionBreakpoints();
+	// 	// clear all instruction breakpoints
+	// 	this._runtime.clearInstructionBreakpoints();
 
-		// set instruction breakpoints
-		const breakpoints = args.breakpoints.map(ibp => {
-			const address = parseInt(ibp.instructionReference);
-			const offset = ibp.offset || 0;
-			return <DebugProtocol.Breakpoint>{
-				verified: this._runtime.setInstructionBreakpoint(address + offset)
-			};
-		});
+	// 	// set instruction breakpoints
+	// 	const breakpoints = args.breakpoints.map(ibp => {
+	// 		const address = parseInt(ibp.instructionReference);
+	// 		const offset = ibp.offset || 0;
+	// 		return <DebugProtocol.Breakpoint>{
+	// 			verified: this._runtime.setInstructionBreakpoint(address + offset)
+	// 		};
+	// 	});
 
-		response.body = {
-			breakpoints: breakpoints
-		};
-		this.sendResponse(response);
-	}
+	// 	response.body = {
+	// 		breakpoints: breakpoints
+	// 	};
+	// 	this.sendResponse(response);
+	// }
 
-	protected customRequest(command: string, response: DebugProtocol.Response, args: any) {
-		if (command === 'toggleFormatting') {
-			this._valuesInHex = ! this._valuesInHex;
-			if (this._useInvalidatedEvent) {
-				this.sendEvent(new InvalidatedEvent( ['variables'] ));
-			}
-			this.sendResponse(response);
-		} else {
-			super.customRequest(command, response, args);
-		}
-	}
+	// protected customRequest(command: string, response: DebugProtocol.Response, args: any) {
+	// 	if (command === 'toggleFormatting') {
+	// 		this._valuesInHex = ! this._valuesInHex;
+	// 		if (this._useInvalidatedEvent) {
+	// 			this.sendEvent(new InvalidatedEvent( ['variables'] ));
+	// 		}
+	// 		this.sendResponse(response);
+	// 	} else {
+	// 		super.customRequest(command, response, args);
+	// 	}
+	// }
 
-	//---- helpers
+	// //---- helpers
 
-	private convertToRuntime(value: string): IRuntimeVariableType {
+	// private convertToRuntime(value: string): IRuntimeVariableType {
 
-		value= value.trim();
+	// 	value= value.trim();
 
-		if (value === 'true') {
-			return true;
-		}
-		if (value === 'false') {
-			return false;
-		}
-		if (value[0] === '\'' || value[0] === '"') {
-			return value.substr(1, value.length-2);
-		}
-		const n = parseFloat(value);
-		if (!isNaN(n)) {
-			return n;
-		}
-		return value;
-	}
+	// 	if (value === 'true') {
+	// 		return true;
+	// 	}
+	// 	if (value === 'false') {
+	// 		return false;
+	// 	}
+	// 	if (value[0] === '\'' || value[0] === '"') {
+	// 		return value.substr(1, value.length-2);
+	// 	}
+	// 	const n = parseFloat(value);
+	// 	if (!isNaN(n)) {
+	// 		return n;
+	// 	}
+	// 	return value;
+	// }
 
-	private convertFromRuntime(v: IRuntimeVariable): DebugProtocol.Variable {
+	// private convertFromRuntime(v: IRuntimeVariable): DebugProtocol.Variable {
 
-		let dapVariable: DebugProtocol.Variable = {
-			name: v.name,
-			value: '???',
-			type: typeof v.value,
-			variablesReference: 0,
-			evaluateName: '$' + v.name
-		};
+	// 	let dapVariable: DebugProtocol.Variable = {
+	// 		name: v.name,
+	// 		value: '???',
+	// 		type: typeof v.value,
+	// 		variablesReference: 0,
+	// 		evaluateName: '$' + v.name
+	// 	};
 
-		if (Array.isArray(v.value)) {
-			dapVariable.value = 'Object';
-			dapVariable.variablesReference = this._variableHandles.create(v);
-		} else {
-			switch (typeof v.value) {
-				case 'number':
-					if (Math.round(v.value) === v.value) {
-						dapVariable.value = this.formatNumber(v.value);
-						(<any>dapVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
-						dapVariable.type = 'integer';
-					} else {
-						dapVariable.value = v.value.toString();
-						dapVariable.type = 'float';
-					}
-					break;
-				case 'string':
-					dapVariable.value = `"${v.value}"`;
-					break;
-				case 'boolean':
-					dapVariable.value = v.value ? 'true' : 'false';
-					break;
-				default:
-					dapVariable.value = typeof v.value;
-					break;		
-			}
-		}
+	// 	if (Array.isArray(v.value)) {
+	// 		dapVariable.value = 'Object';
+	// 		dapVariable.variablesReference = this._variableHandles.create(v);
+	// 	} else {
+	// 		switch (typeof v.value) {
+	// 			case 'number':
+	// 				if (Math.round(v.value) === v.value) {
+	// 					dapVariable.value = this.formatNumber(v.value);
+	// 					(<any>dapVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
+	// 					dapVariable.type = 'integer';
+	// 				} else {
+	// 					dapVariable.value = v.value.toString();
+	// 					dapVariable.type = 'float';
+	// 				}
+	// 				break;
+	// 			case 'string':
+	// 				dapVariable.value = `"${v.value}"`;
+	// 				break;
+	// 			case 'boolean':
+	// 				dapVariable.value = v.value ? 'true' : 'false';
+	// 				break;
+	// 			default:
+	// 				dapVariable.value = typeof v.value;
+	// 				break;		
+	// 		}
+	// 	}
 
-		return dapVariable;
-	}
+	// 	return dapVariable;
+	// }
 
-	private formatAddress(x: number, pad = 8) {
-		return this._addressesInHex ? '0x' + x.toString(16).padStart(8, '0') : x.toString(10);
-	}
+	// private formatAddress(x: number, pad = 8) {
+	// 	return this._addressesInHex ? '0x' + x.toString(16).padStart(8, '0') : x.toString(10);
+	// }
 
-	private formatNumber(x: number) {
-		return this._valuesInHex ? '0x' + x.toString(16) : x.toString(10);
-	}
+	// private formatNumber(x: number) {
+	// 	return this._valuesInHex ? '0x' + x.toString(16) : x.toString(10);
+	// }
 
 	private createSource(filePath: string): Source {
 		return new Source(basename(filePath), this.convertDebuggerPathToClient(filePath), undefined, undefined, 'mock-adapter-data');

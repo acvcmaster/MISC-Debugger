@@ -132,7 +132,9 @@
     "debuggers": [
       {
         "type": "mock",
-        "languages": ["markdown"],
+        "languages": [
+          "markdown"
+        ],
         "label": "Mock Debug",
         "program": "./out/debugAdapter.js",
         "runtime": "node",
@@ -160,16 +162,16 @@
               "compileError": {
                 "type": "string",
                 "description": "Simulates a compile error in 'launch' request.",
-								"enum": [
-									"default",
-									"show",
-									"hide"
-								],
-								"enumDescriptions": [
+                "enum": [
+                  "default",
+                  "show",
+                  "hide"
+                ],
+                "enumDescriptions": [
                   "default: show fake compile error to user",
-									"show fake compile error to user",
-									"do not show fake compile error to user"
-								]
+                  "show fake compile error to user",
+                  "do not show fake compile error to user"
+                ]
               }
             }
           }

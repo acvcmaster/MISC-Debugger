@@ -7,8 +7,8 @@
 		{
 			"type": "mock",
 			"request": "launch",
-			"name": "Debug readme.md",
-			"program": "${workspaceFolder}/readme.md",
+			"name": "Debug",
+			"program": "${workspaceFolder}/fib.misc",
 			"stopOnEntry": true,
 			"trace": false
 		}
