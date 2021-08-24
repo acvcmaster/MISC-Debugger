@@ -7,7 +7,7 @@ import { DebugProtocol } from 'vscode-debugprotocol';
 // import { basename } from 'path';
 import { FileAccessor, RuntimeAdapter, RuntimeBreakpoint } from './mockRuntime';
 import { Subject } from 'await-notify';
-import { LoggingDebugSession, StoppedEvent, InitializedEvent, logger, Logger, Breakpoint, BreakpointEvent, Scope, Thread, OutputEvent, Source, TerminatedEvent, StackFrame } from 'vscode-debugadapter';
+import { LoggingDebugSession, StoppedEvent, InitializedEvent, logger, Logger, Breakpoint, BreakpointEvent, Scope, Thread, OutputEvent, Source, TerminatedEvent, StackFrame, Handles } from 'vscode-debugadapter';
 import { basename } from 'path';
 
 /**
@@ -37,6 +37,7 @@ export class MockDebugSession extends LoggingDebugSession {
 	// a Mock runtime (or debugger)
 	private runtimeAdapter: RuntimeAdapter;
 	private configurationDone = new Subject();
+	private handles = new Handles<'locals' | 'globals' | any>();
 
 	/**
 	 * Creates a new debug adapter that is used for one debug session.
@@ -176,9 +177,12 @@ export class MockDebugSession extends LoggingDebugSession {
 		this.sendResponse({ ...response, body: { ...response.body, breakpoints } });
 	}
 
-	protected breakpointLocationsRequest(response: DebugProtocol.BreakpointLocationsResponse, args: DebugProtocol.BreakpointLocationsArguments, request?: DebugProtocol.Request): void {
+	protected async breakpointLocationsRequest(response: DebugProtocol.BreakpointLocationsResponse, args: DebugProtocol.BreakpointLocationsArguments, request?: DebugProtocol.Request): Promise<void> {
+		const breakpoints = await this.runtimeAdapter.getBreakpoints(); // array
+
 		response.body = {
-			breakpoints: []
+			// breakpoints: breakpoints.map(item => ({ ...item, line: this.convertDebuggerLineToClient(item.line) }))
+			breakpoints
 		};
 
 		this.sendResponse(response);
@@ -255,29 +259,23 @@ export class MockDebugSession extends LoggingDebugSession {
 
 		response.body = {
 			scopes: [
-				new Scope("Globals", 0, true)
+				new Scope("Globals", this.handles.create('globals'), true)
 			]
 		};
 		this.sendResponse(response);
 	}
 
 	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): Promise<void> {
-		this.sendResponse({
-			...response, body: {
-				...response.body, variables: [
-					{ name: 'global_R1', value: 0 },
-					{ name: 'global_R2', value: 0 },
-					{ name: 'global_R3', value: 0 },
-					{ name: 'global_R4', value: 0 },
-					{ name: 'global_IP', value: 0 },
-					{ name: 'global_SP', value: 0 }
-				]
-			}
-		});
+		const variables = await this.runtimeAdapter.getVariables();
+
+		response.body = {
+			variables: variables.map(v => this.convertFromRuntime(v))
+		};
+		this.sendResponse(response);
 	}
 
 	protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): void {
-		// const scope = this._variableHandles.get(args.variablesReference);
+		// const scope = this.handles.get(args.variablesReference);
 		// if (scope === 'locals') {
 		// 	const rv = this._runtime.getLocalVariable(args.name);
 		// 	if (rv) {
@@ -613,53 +611,29 @@ export class MockDebugSession extends LoggingDebugSession {
 	// 	return value;
 	// }
 
-	// private convertFromRuntime(v: IRuntimeVariable): DebugProtocol.Variable {
+	private convertFromRuntime(v: any): DebugProtocol.Variable {
 
-	// 	let dapVariable: DebugProtocol.Variable = {
-	// 		name: v.name,
-	// 		value: '???',
-	// 		type: typeof v.value,
-	// 		variablesReference: 0,
-	// 		evaluateName: '$' + v.name
-	// 	};
+		let dapVariable: DebugProtocol.Variable = {
+			name: v.name,
+			value: this.formatNumber(v.value),
+			type: 'integer',
+			variablesReference: 0,
+			evaluateName: '$' + v.name
+		};
 
-	// 	if (Array.isArray(v.value)) {
-	// 		dapVariable.value = 'Object';
-	// 		dapVariable.variablesReference = this._variableHandles.create(v);
-	// 	} else {
-	// 		switch (typeof v.value) {
-	// 			case 'number':
-	// 				if (Math.round(v.value) === v.value) {
-	// 					dapVariable.value = this.formatNumber(v.value);
-	// 					(<any>dapVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
-	// 					dapVariable.type = 'integer';
-	// 				} else {
-	// 					dapVariable.value = v.value.toString();
-	// 					dapVariable.type = 'float';
-	// 				}
-	// 				break;
-	// 			case 'string':
-	// 				dapVariable.value = `"${v.value}"`;
-	// 				break;
-	// 			case 'boolean':
-	// 				dapVariable.value = v.value ? 'true' : 'false';
-	// 				break;
-	// 			default:
-	// 				dapVariable.value = typeof v.value;
-	// 				break;		
-	// 		}
-	// 	}
+		(<any>dapVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
 
-	// 	return dapVariable;
-	// }
+		return dapVariable;
+	}
 
 	// private formatAddress(x: number, pad = 8) {
 	// 	return this._addressesInHex ? '0x' + x.toString(16).padStart(8, '0') : x.toString(10);
 	// }
 
-	// private formatNumber(x: number) {
-	// 	return this._valuesInHex ? '0x' + x.toString(16) : x.toString(10);
-	// }
+	private formatNumber(number: number): string {
+		// return '0x' + x.toString(16);
+		return `${number}`;
+	}
 
 	private createSource(filePath: string): Source {
 		return new Source(basename(filePath), this.convertDebuggerPathToClient(filePath), undefined, undefined, 'mock-adapter-data');

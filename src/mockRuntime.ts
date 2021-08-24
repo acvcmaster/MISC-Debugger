@@ -44,8 +44,6 @@ export class RuntimeAdapter extends EventEmitter {
 	clientSubject = new Subject<Socket | undefined>();
 	dataSubject = new Subject<any | undefined>();
 
-	// eslint-disable-next-line @typescript-eslint/naming-convention
-	__mockLine = 0;
 
 	public start(path: string, stopAtEntry = false): Promise<ProgramStartResponse> {
 		return new Promise(async (resolve, _) => {
@@ -191,28 +189,54 @@ export class RuntimeAdapter extends EventEmitter {
 		});
 	}
 
-	// private getLineInformation(): Promise<{ line: number; column?: number }> {
-	// 	return new Promise((resolve, _) => {
-	// 		// query backend for line
-	// 		resolve({ line: this.__mockLine });
-	// 	});
-	// }
+	public getBreakpoints(): Promise<{ line: number }[]> {
+		return new Promise(async (resolve, _) => {
+			const guid = v4();
+			this.client?.write(JSON.stringify({
+				debugCommand: 'getBreakpoints',
+				guid
+			}));
 
-	// private async printLine() {
-	// 	const lineInformation = await this.getLineInformation();
-	// 	this.sendEvent('output', this.sourceLines ? this.sourceLines[lineInformation.line] : null, this.sourcePath, lineInformation.line, lineInformation.column);
-	// }
+			const subscription = this.dataSubject.subscribe(data => {
+				if (data && data.guid === guid) {
+					subscription.unsubscribe();
+					resolve(data.lines);
+				}
+			});
+		});
+	}
 
 	public continue(): Promise<void> {
 		return new Promise(async (resolve, _) => {
-			while (true) {
-				const end = await this.step();
-				if (end) {
-					break;
-				}
-			}
+			const guid = v4();
+			this.client?.write(JSON.stringify({
+				debugCommand: 'continue',
+				guid
+			}));
 
-			resolve();
+			const subscription = this.dataSubject.subscribe(data => {
+				if (data && data.guid === guid) {
+					subscription.unsubscribe();
+					resolve(data.debugCommand);
+				}
+			});
+		});
+	}
+
+	getVariables(): Promise<any[]> {
+		return new Promise(async (resolve, _) => {
+			const guid = v4();
+			this.client?.write(JSON.stringify({
+				debugCommand: 'getVariables',
+				guid
+			}));
+
+			const subscription = this.dataSubject.subscribe(data => {
+				if (data && data.guid === guid) {
+					subscription.unsubscribe();
+					resolve(data.variables || []);
+				}
+			});
 		});
 	}
 
