@@ -152,6 +152,11 @@ export class MockDebugSession extends LoggingDebugSession {
 		}
 	}
 
+	protected disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments, request?: DebugProtocol.Request): void {
+		this.runtimeAdapter.disconnect();
+		this.sendResponse(response);
+	}
+
 	protected async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
 		const clientLines = args.lines || [];
 
@@ -289,7 +294,6 @@ export class MockDebugSession extends LoggingDebugSession {
 	}
 
 	protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
-		console.log(args);
 		await this.runtimeAdapter.step();
 		this.sendResponse(response);
 	}
