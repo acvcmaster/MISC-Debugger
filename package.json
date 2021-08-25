@@ -43,7 +43,10 @@
     "package-web": "webpack --mode production --config ./build/web-extension.webpack.config.js"
   },
   "dependencies": {
+    "@types/node-fetch": "^2.5.12",
     "await-notify": "1.0.1",
+    "node-fetch": "^2.6.1",
+    "rxjs": "^7.3.0",
     "vscode-debugadapter": "^1.49.0-pre.0"
   },
   "devDependencies": {
