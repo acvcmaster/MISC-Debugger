@@ -5,7 +5,7 @@
 
 import { DebugProtocol } from 'vscode-debugprotocol';
 // import { basename } from 'path';
-import { FileAccessor, RuntimeAdapter, RuntimeBreakpoint } from './mockRuntime';
+import { FileAccessor, RuntimeClient, RuntimeBreakpoint } from './runtimeClient';
 import { Subject } from 'await-notify';
 import { LoggingDebugSession, StoppedEvent, InitializedEvent, logger, Logger, Breakpoint, BreakpointEvent, Scope, Thread, OutputEvent, Source, TerminatedEvent, StackFrame, Handles } from 'vscode-debugadapter';
 import { basename } from 'path';
@@ -27,13 +27,13 @@ interface ILaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
 	noDebug?: boolean;
 }
 
-export class MockDebugSession extends LoggingDebugSession {
+export class DebugSession extends LoggingDebugSession {
 
 	// we don't support multiple threads, so we can use a hardcoded ID for the default thread
 	private static threadID = 1;
 
-	// a Mock runtime (or debugger)
-	private runtimeAdapter: RuntimeAdapter;
+	// The runtime client
+	private runtimeClient: RuntimeClient;
 	private configurationDone = new Subject();
 	private handles = new Handles<'locals' | 'globals' | any>();
 
@@ -48,7 +48,7 @@ export class MockDebugSession extends LoggingDebugSession {
 		this.setDebuggerLinesStartAt1(false);
 		this.setDebuggerColumnsStartAt1(false);
 
-		this.runtimeAdapter = new RuntimeAdapter(fileAccessor);
+		this.runtimeClient = new RuntimeClient(fileAccessor);
 
 		// setup event handlers
 		this.setupEvents();
@@ -56,26 +56,26 @@ export class MockDebugSession extends LoggingDebugSession {
 
 	/** Setup event handlers */
 	protected setupEvents() {
-		this.runtimeAdapter.on('stopOnEntry', () => {
-			this.sendEvent(new StoppedEvent('entry', MockDebugSession.threadID));
+		this.runtimeClient.on('stopOnEntry', () => {
+			this.sendEvent(new StoppedEvent('entry', DebugSession.threadID));
 		});
-		this.runtimeAdapter.on('stopOnStep', () => {
-			this.sendEvent(new StoppedEvent('step', MockDebugSession.threadID));
+		this.runtimeClient.on('stopOnStep', () => {
+			this.sendEvent(new StoppedEvent('step', DebugSession.threadID));
 		});
-		this.runtimeAdapter.on('stopOnBreakpoint', () => {
-			this.sendEvent(new StoppedEvent('breakpoint', MockDebugSession.threadID));
+		this.runtimeClient.on('stopOnBreakpoint', () => {
+			this.sendEvent(new StoppedEvent('breakpoint', DebugSession.threadID));
 		});
-		this.runtimeAdapter.on('stopOnException', (exception) => {
+		this.runtimeClient.on('stopOnException', (exception) => {
 			if (exception) {
-				this.sendEvent(new StoppedEvent(`exception(${exception})`, MockDebugSession.threadID));
+				this.sendEvent(new StoppedEvent(`exception(${exception})`, DebugSession.threadID));
 			} else {
-				this.sendEvent(new StoppedEvent('exception', MockDebugSession.threadID));
+				this.sendEvent(new StoppedEvent('exception', DebugSession.threadID));
 			}
 		});
-		this.runtimeAdapter.on('breakpointValidated', (breakpoint: RuntimeBreakpoint) => {
+		this.runtimeClient.on('breakpointValidated', (breakpoint: RuntimeBreakpoint) => {
 			this.sendEvent(new BreakpointEvent('changed', { verified: breakpoint.verified, id: breakpoint.id } as DebugProtocol.Breakpoint));
 		});
-		this.runtimeAdapter.on('output', (text, filePath, line, column) => {
+		this.runtimeClient.on('output', (text, filePath, line, column) => {
 			const e: DebugProtocol.OutputEvent = new OutputEvent(`${text}\n`);
 
 			e.body.source = this.createSource(filePath);
@@ -84,7 +84,7 @@ export class MockDebugSession extends LoggingDebugSession {
 
 			this.sendEvent(e);
 		});
-		this.runtimeAdapter.on('end', () => {
+		this.runtimeClient.on('end', () => {
 			this.sendEvent(new TerminatedEvent());
 		});
 	}
@@ -135,7 +135,7 @@ export class MockDebugSession extends LoggingDebugSession {
 		await this.configurationDone.wait(1000);
 
 		// start the program in the runtime
-		const startResponse = await this.runtimeAdapter.start(args.program, !!args.stopOnEntry);
+		const startResponse = await this.runtimeClient.start(args.program, !!args.stopOnEntry);
 
 		if (startResponse.error) {
 			// simulate a compile/build error in "launch" request:
@@ -143,7 +143,7 @@ export class MockDebugSession extends LoggingDebugSession {
 			// A missing 'showUser' should result in a modal dialog.
 			this.sendErrorResponse(response, {
 				id: 1001,
-				format: `${startResponse.error}`,
+				format: `Runtime: ${startResponse.error}`,
 				showUser: true
 			});
 		} else {
@@ -152,7 +152,7 @@ export class MockDebugSession extends LoggingDebugSession {
 	}
 
 	protected disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments, request?: DebugProtocol.Request): void {
-		this.runtimeAdapter.disconnect();
+		this.runtimeClient.disconnect();
 		this.sendResponse(response);
 	}
 
@@ -160,11 +160,11 @@ export class MockDebugSession extends LoggingDebugSession {
 		const clientLines = args.lines || [];
 
 		// clear all breakpoints for this file
-		await this.runtimeAdapter.clearBreakpoints();
+		await this.runtimeClient.clearBreakpoints();
 
 		// set and verify breakpoint locations
 		const trueBreakpoints = clientLines.map(async l => {
-			const { verified, line, id } = await this.runtimeAdapter.setBreakPoint(this.convertClientLineToDebugger(l));
+			const { verified, line, id } = await this.runtimeClient.setBreakPoint(this.convertClientLineToDebugger(l));
 			const breakpoint = new Breakpoint(verified, this.convertDebuggerLineToClient(line)) as DebugProtocol.Breakpoint;
 			return { ...breakpoint, id };
 		});
@@ -176,14 +176,8 @@ export class MockDebugSession extends LoggingDebugSession {
 	}
 
 	protected async breakpointLocationsRequest(response: DebugProtocol.BreakpointLocationsResponse, args: DebugProtocol.BreakpointLocationsArguments, request?: DebugProtocol.Request): Promise<void> {
-		const breakpoints = await this.runtimeAdapter.getBreakpoints(); // array
-
-		response.body = {
-			// breakpoints: breakpoints.map(item => ({ ...item, line: this.convertDebuggerLineToClient(item.line) }))
-			breakpoints
-		};
-
-		this.sendResponse(response);
+		const breakpoints = await this.runtimeClient.getBreakpoints(); // array
+		this.sendResponse({ ...response, body: { ...breakpoints } });
 	}
 
 	protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
@@ -191,7 +185,7 @@ export class MockDebugSession extends LoggingDebugSession {
 		// runtime supports no threads so just return a default thread.
 		response.body = {
 			threads: [
-				new Thread(MockDebugSession.threadID, "Thread 1")
+				new Thread(DebugSession.threadID, "Thread 1")
 			]
 		};
 		this.sendResponse(response);
@@ -199,7 +193,7 @@ export class MockDebugSession extends LoggingDebugSession {
 
 	protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
 
-		const stackFrames = await this.runtimeAdapter.getStackFrames();
+		const stackFrames = await this.runtimeClient.getStackFrames();
 
 		response.body = {
 			stackFrames: stackFrames.frames.map(frame =>
@@ -214,18 +208,19 @@ export class MockDebugSession extends LoggingDebugSession {
 
 		response.body = {
 			scopes: [
-				new Scope("Globals", this.handles.create('globals'), true)
+				new Scope("Globals", this.handles.create('globals'), false)
 			]
 		};
 		this.sendResponse(response);
 	}
 
 	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments, request?: DebugProtocol.Request): Promise<void> {
-		const variables = await this.runtimeAdapter.getVariables();
+		const variables = await this.runtimeClient.getVariables();
 
 		response.body = {
-			variables: variables.map(v => this.convertFromRuntime(v))
+			variables: variables?.map(variable => this.getDebugVariable(variable))
 		};
+
 		this.sendResponse(response);
 	}
 
@@ -242,33 +237,28 @@ export class MockDebugSession extends LoggingDebugSession {
 	}
 
 	protected async continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
-		await this.runtimeAdapter.continue();
+		await this.runtimeClient.continue();
 		this.sendResponse(response);
 	}
 
 	protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
-		await this.runtimeAdapter.step();
+		await this.runtimeClient.step();
 		this.sendResponse(response);
 	}
 
-	private convertFromRuntime(v: any): DebugProtocol.Variable {
+	private getDebugVariable(variable: any): DebugProtocol.Variable {
 
-		let dapVariable: DebugProtocol.Variable = {
-			name: v.name,
-			value: this.formatNumber(v.value),
-			type: 'integer',
+		let debugVariable: DebugProtocol.Variable = {
+			name: variable.name,
+			value: variable.value,
+			type: variable.type,
 			variablesReference: 0,
-			evaluateName: '$' + v.name
+			evaluateName: variable.evaluateName
 		};
 
-		(<any>dapVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
+		(<any>debugVariable).__vscodeVariableMenuContext = 'simple';	// enable context menu contribution
 
-		return dapVariable;
-	}
-
-	private formatNumber(number: number): string {
-		// return '0x' + x.toString(16);
-		return `${number}`;
+		return debugVariable as DebugProtocol.Variable;
 	}
 
 	private createSource(filePath: string): Source {

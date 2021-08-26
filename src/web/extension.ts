@@ -3,10 +3,10 @@
  *--------------------------------------------------------*/
 
 import * as vscode from 'vscode';
-import { activateMockDebug } from '../activateMockDebug';
+import { activateDebugger } from '../activateDebugger';
 
 export function activate(context: vscode.ExtensionContext) {
-	activateMockDebug(context);
+	activateDebugger(context);
 }
 
 export function deactivate() {

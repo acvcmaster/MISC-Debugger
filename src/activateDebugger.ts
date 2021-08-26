@@ -6,10 +6,10 @@
 
 import * as vscode from 'vscode';
 import { WorkspaceFolder, DebugConfiguration, ProviderResult, CancellationToken } from 'vscode';
-import { MockDebugSession } from './mockDebug';
-import { FileAccessor } from './mockRuntime';
+import { DebugSession } from './debugSession';
+import { FileAccessor } from './runtimeClient';
 
-export function activateMockDebug(context: vscode.ExtensionContext, factory?: vscode.DebugAdapterDescriptorFactory) {
+export function activateDebugger(context: vscode.ExtensionContext, factory?: vscode.DebugAdapterDescriptorFactory) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('extension.mock-debug.runEditorContents', (resource: vscode.Uri) => {
@@ -59,7 +59,7 @@ export function activateMockDebug(context: vscode.ExtensionContext, factory?: vs
 	}));
 
 	// register a configuration provider for 'mock' debug type
-	const provider = new MockConfigurationProvider();
+	const provider = new ConfigurationProvider();
 	context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider('mock', provider));
 
 	// register a dynamic configuration provider for 'mock' debug type
@@ -149,7 +149,7 @@ export function activateMockDebug(context: vscode.ExtensionContext, factory?: vs
 	}));
 }
 
-class MockConfigurationProvider implements vscode.DebugConfigurationProvider {
+class ConfigurationProvider implements vscode.DebugConfigurationProvider {
 
 	/**
 	 * Massage a debug configuration just before a debug session is being launched,
@@ -202,6 +202,6 @@ export const workspaceFileAccessor: FileAccessor = {
 class InlineDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
 
 	createDebugAdapterDescriptor(_session: vscode.DebugSession): ProviderResult<vscode.DebugAdapterDescriptor> {
-		return new vscode.DebugAdapterInlineImplementation(new MockDebugSession(workspaceFileAccessor));
+		return new vscode.DebugAdapterInlineImplementation(new DebugSession(workspaceFileAccessor));
 	}
 }
